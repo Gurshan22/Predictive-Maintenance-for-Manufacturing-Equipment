@@ -1,0 +1,357 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report, precision_recall_curve, roc_curve, auc
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import Dense, LSTM, Dropout, BatchNormalization
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+import os
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set random seeds for reproducibility
+np.random.seed(42)
+import tensorflow as tf
+tf.random.set_seed(42)
+
+# Function to load NASA Turbofan Engine dataset
+def load_nasa_data(path_to_data):
+    """
+    Load and process NASA Turbofan Engine Degradation Dataset
+    """
+    # Load training data
+    train_file = os.path.join(path_to_data, 'train_FD001.txt')
+    train_df = pd.read_csv(train_file, sep=' ', header=None)
+    # Remove columns that contain NaN (last two columns)
+    train_df = train_df.iloc[:, :-2]
+    
+    # Rename columns
+    train_df.columns = ['unit_nr', 'cycle', 'op_setting_1', 'op_setting_2', 'op_setting_3'] + [
+        f'sensor_{i}' for i in range(1, 22)
+    ]
+    
+    # Load RUL (Remaining Useful Life) data
+    rul_file = os.path.join(path_to_data, 'RUL_FD001.txt')
+    rul_df = pd.read_csv(rul_file, header=None)
+    rul_df.columns = ['RUL']
+    
+    # Load test data
+    test_file = os.path.join(path_to_data, 'test_FD001.txt')
+    test_df = pd.read_csv(test_file, sep=' ', header=None)
+    test_df = test_df.iloc[:, :-2]
+    test_df.columns = train_df.columns
+    
+    return train_df, test_df, rul_df
+
+# Data preprocessing function
+def preprocess_data(train_df, test_df, rul_df, sequence_length=50, threshold=30):
+    """
+    Preprocess data for LSTM model:
+    - Normalize sensor readings
+    - Create sequences
+    - Create binary labels (1 for imminent failure, 0 otherwise)
+    """
+    # Calculate RUL for training data
+    train_rul = pd.DataFrame(columns=['unit_nr', 'cycle', 'RUL'])
+    for unit in train_df['unit_nr'].unique():
+        max_cycle = train_df[train_df['unit_nr'] == unit]['cycle'].max()
+        cycle_df = train_df[train_df['unit_nr'] == unit].copy()
+        cycle_df['RUL'] = max_cycle - cycle_df['cycle']
+        temp_df = pd.DataFrame({'unit_nr': [unit] * len(cycle_df),
+                              'cycle': cycle_df['cycle'],
+                              'RUL': cycle_df['RUL']})
+        train_rul = pd.concat([train_rul, temp_df])
+    
+    # Merge RUL with training data
+    train_df = train_df.merge(train_rul, on=['unit_nr', 'cycle'])
+    
+    # Calculate RUL for test data
+    test_rul = pd.DataFrame(columns=['unit_nr', 'RUL_max'])
+    for i, unit in enumerate(test_df['unit_nr'].unique()):
+        max_cycle = test_df[test_df['unit_nr'] == unit]['cycle'].max()
+        test_rul.loc[i] = [unit, max_cycle + rul_df.iloc[i, 0]]
+    
+    # Merge RUL with test data
+    test_with_rul = pd.DataFrame(columns=train_df.columns)
+    for unit in test_df['unit_nr'].unique():
+        unit_df = test_df[test_df['unit_nr'] == unit].copy()
+        max_cycle = unit_df['cycle'].max()
+        rul_max = test_rul[test_rul['unit_nr'] == unit]['RUL_max'].values[0]
+        unit_df['RUL'] = rul_max - unit_df['cycle']
+        test_with_rul = pd.concat([test_with_rul, unit_df])
+    
+    # Create binary labels for classification
+    train_df['label'] = (train_df['RUL'] <= threshold).astype(int)
+    test_with_rul['label'] = (test_with_rul['RUL'] <= threshold).astype(int)
+    
+    # Select features for model
+    features = ['cycle', 'op_setting_1', 'op_setting_2', 'op_setting_3'] + [
+        f'sensor_{i}' for i in range(1, 22)
+    ]
+    
+    # Normalize features
+    scaler = StandardScaler()
+    train_df_norm = pd.DataFrame(
+        scaler.fit_transform(train_df[features]),
+        columns=features
+    )
+    test_df_norm = pd.DataFrame(
+        scaler.transform(test_with_rul[features]),
+        columns=features
+    )
+    
+    # Add unit number and labels back
+    train_df_norm['unit_nr'] = train_df['unit_nr'].values
+    train_df_norm['label'] = train_df['label'].values
+    train_df_norm['RUL'] = train_df['RUL'].values
+    
+    test_df_norm['unit_nr'] = test_with_rul['unit_nr'].values
+    test_df_norm['label'] = test_with_rul['label'].values
+    test_df_norm['RUL'] = test_with_rul['RUL'].values
+    
+    # Create sequences
+    def create_sequences(df, sequence_length):
+        sequences = []
+        labels = []
+        for unit in df['unit_nr'].unique():
+            unit_data = df[df['unit_nr'] == unit].drop(['unit_nr'], axis=1)
+            unit_data_np = unit_data.drop(['label', 'RUL'], axis=1).values
+            
+            for i in range(len(unit_data) - sequence_length + 1):
+                sequences.append(unit_data_np[i:i+sequence_length])
+                # Use the label of the last time step in the sequence
+                labels.append(unit_data['label'].iloc[i+sequence_length-1])
+        
+        return np.array(sequences), np.array(labels)
+    
+    X_train, y_train = create_sequences(train_df_norm, sequence_length)
+    X_test, y_test = create_sequences(test_df_norm, sequence_length)
+    
+    # Split training data into training and validation
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train, y_train, test_size=0.2, random_state=42, stratify=y_train
+    )
+    
+    return X_train, X_val, X_test, y_train, y_val, y_test, scaler
+
+# Build LSTM model
+def build_lstm_model(input_shape):
+    """
+    Build an LSTM model for binary classification
+    """
+    model = Sequential([
+        LSTM(128, input_shape=input_shape, return_sequences=True),
+        BatchNormalization(),
+        Dropout(0.3),
+        LSTM(64),
+        BatchNormalization(),
+        Dropout(0.3),
+        Dense(32, activation='relu'),
+        BatchNormalization(),
+        Dropout(0.3),
+        Dense(1, activation='sigmoid')
+    ])
+    
+    model.compile(
+        loss='binary_crossentropy',
+        optimizer='adam',
+        metrics=['accuracy', tf.keras.metrics.Precision(), tf.keras.metrics.Recall(), tf.keras.metrics.AUC()]
+    )
+    
+    return model
+
+# Main function to run the entire pipeline
+def main(data_path, sequence_length=50, threshold=30, epochs=50, batch_size=64):
+    """
+    Main function to run the entire predictive maintenance pipeline
+    """
+    print("Loading and preprocessing data...")
+    train_df, test_df, rul_df = load_nasa_data(data_path)
+    
+    print("Data overview:")
+    print(f"Training data shape: {train_df.shape}")
+    print(f"Test data shape: {test_df.shape}")
+    
+    # Create sequences for LSTM model
+    X_train, X_val, X_test, y_train, y_val, y_test, scaler = preprocess_data(
+        train_df, test_df, rul_df, sequence_length, threshold
+    )
+    
+    print(f"Training sequences shape: {X_train.shape}")
+    print(f"Validation sequences shape: {X_val.shape}")
+    print(f"Test sequences shape: {X_test.shape}")
+    
+    # Build and train model
+    print("Building LSTM model...")
+    model = build_lstm_model((sequence_length, X_train.shape[2]))
+    model.summary()
+    
+    # Callbacks
+    callbacks = [
+        EarlyStopping(monitor='val_auc', patience=10, mode='max', restore_best_weights=True),
+        ModelCheckpoint('best_lstm_model.h5', monitor='val_auc', mode='max', save_best_only=True),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
+    ]
+    
+    print("Training model...")
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=callbacks,
+        verbose=1
+    )
+    
+    # Load the best model
+    model = load_model('best_lstm_model.h5')
+    
+    # Evaluate on test set
+    print("Evaluating model on test set...")
+    test_results = model.evaluate(X_test, y_test, verbose=0)
+    print(f"Test Loss: {test_results[0]:.4f}")
+    print(f"Test Accuracy: {test_results[1]:.4f}")
+    print(f"Test Precision: {test_results[2]:.4f}")
+    print(f"Test Recall: {test_results[3]:.4f}")
+    print(f"Test AUC: {test_results[4]:.4f}")
+    
+    # Make predictions on test set
+    y_pred_prob = model.predict(X_test)
+    y_pred = (y_pred_prob > 0.5).astype(int)
+    
+    # Print classification report
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred, target_names=['No Failure', 'Imminent Failure']))
+    
+    # Plot confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=['No Failure', 'Imminent Failure'],
+                yticklabels=['No Failure', 'Imminent Failure'])
+    plt.title('Confusion Matrix')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.tight_layout()
+    plt.savefig('lstm_confusion_matrix.png')
+    plt.close()
+    
+    # Plot ROC curve
+    fpr, tpr, _ = roc_curve(y_test, y_pred_prob)
+    roc_auc = auc(fpr, tpr)
+    
+    plt.figure(figsize=(10, 8))
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (area = {roc_auc:.3f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC) Curve')
+    plt.legend(loc="lower right")
+    plt.savefig('lstm_roc_curve.png')
+    plt.close()
+    
+    # Plot Precision-Recall curve
+    precision, recall, _ = precision_recall_curve(y_test, y_pred_prob)
+    pr_auc = auc(recall, precision)
+    
+    plt.figure(figsize=(10, 8))
+    plt.plot(recall, precision, color='blue', lw=2, label=f'PR curve (area = {pr_auc:.3f})')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('Precision-Recall Curve')
+    plt.legend(loc="lower left")
+    plt.savefig('lstm_pr_curve.png')
+    plt.close()
+    
+    # Plot training history
+    plt.figure(figsize=(12, 10))
+    
+    plt.subplot(2, 2, 1)
+    plt.plot(history.history['loss'], label='Training Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title('Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    plt.subplot(2, 2, 2)
+    plt.plot(history.history['accuracy'], label='Training Accuracy')
+    plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    plt.title('Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    
+    plt.subplot(2, 2, 3)
+    plt.plot(history.history['auc'], label='Training AUC')
+    plt.plot(history.history['val_auc'], label='Validation AUC')
+    plt.title('AUC')
+    plt.xlabel('Epoch')
+    plt.ylabel('AUC')
+    plt.legend()
+    
+    plt.subplot(2, 2, 4)
+    plt.plot(history.history['recall'], label='Training Recall')
+    plt.plot(history.history['val_recall'], label='Validation Recall')
+    plt.title('Recall (Sensitivity)')
+    plt.xlabel('Epoch')
+    plt.ylabel('Recall')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig('lstm_training_history.png')
+    plt.close()
+    
+    # Implement early warning system with different thresholds
+    thresholds = [0.3, 0.5, 0.7, 0.9]
+    plt.figure(figsize=(12, 8))
+    
+    for threshold in thresholds:
+        y_pred_thresh = (y_pred_prob >= threshold).astype(int)
+        precision = np.sum((y_pred_thresh == 1) & (y_test == 1)) / (np.sum(y_pred_thresh == 1) + 1e-10)
+        recall = np.sum((y_pred_thresh == 1) & (y_test == 1)) / (np.sum(y_test == 1) + 1e-10)
+        f1 = 2 * precision * recall / (precision + recall + 1e-10)
+        
+        print(f"\nAlert Threshold: {threshold}")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"F1 Score: {f1:.4f}")
+        
+        # Calculate confusion matrix
+        cm_thresh = confusion_matrix(y_test, y_pred_thresh)
+        tn, fp, fn, tp = cm_thresh.ravel()
+        
+        # Plot confusion matrix for this threshold
+        plt.subplot(2, 2, thresholds.index(threshold) + 1)
+        sns.heatmap(cm_thresh, annot=True, fmt='d', cmap='Blues',
+                    xticklabels=['No Failure', 'Imminent Failure'],
+                    yticklabels=['No Failure', 'Imminent Failure'])
+        plt.title(f'Threshold: {threshold} (P={precision:.2f}, R={recall:.2f})')
+    
+    plt.tight_layout()
+    plt.savefig('threshold_comparison.png')
+    plt.close()
+    
+    # Cost-benefit analysis
+    cost_preventive = 1000  # Estimated cost of preventive maintenance
+    cost_failure = 10000    # Estimated cost of equipment failure
+    
+    def calculate_costs(y_true, y_pred, cost_preventive, cost_failure):
+        cm = confusion_matrix(y_true, y_pred)
+        tn, fp, fn, tp = cm.ravel()
+        
+        # False positives: unnecessary preventive maintenance
+        cost_fp = fp * cost_preventive
+        
+        # False negatives: unexpected failures
+        cost_fn = fn * cost_failure
+        
+        # True positives: necessary preventive maintenance
+        cost_
